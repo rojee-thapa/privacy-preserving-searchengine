@@ -33,6 +33,30 @@ app = FastAPI(
     description="Fetches results via SearXNG, summarizes via OpenAI, returns raw + summary"
 )
 
+from fastapi import Request
+
+@app.middleware("http")
+async def strip_identifying_headers(request: Request, call_next):
+    # Headers to remove for privacy
+    blocked = {
+        "user-agent",
+        "accept-language",
+        "referer",
+        "x-forwarded-for",
+        "x-real-ip",
+        "dnt",
+    }
+
+    # Filter headers
+    filtered = [(k, v) for k, v in request.headers.items() if k.lower() not in blocked]
+
+    # Monkey-patch headers for downstream handlers
+    request._headers = filtered
+
+    # Continue processing request
+    response = await call_next(request)
+    return response
+
 # Enable CORS
 origins = [
     "http://localhost:3000",
@@ -138,22 +162,38 @@ def search(
         summary=summary_text
     )
 
+# ----------------- SEARCH ENDPOINT -----------------
+@app.get("/search", response_model=SearchResponse)
+def search(
+    q: str = Query(...),
+    category: str = Query("general"),
+    language: str = Query("en"),
+    num_results: int = Query(5, ge=1, le=20)
+):
+    return perform_search(q, category, language, num_results)
 
-# ----------------- CHAT ENDPOINT -----------------
-# ----------------- COMBINED CHAT + SEARCH ENDPOINT -----------------
+# ----------------- COMBINED CHAT + SEARCH ENDPOINT (Updated for last 10 messages) -----------------
 @app.post("/chat", response_model=dict)
 def chat_with_search_and_summary(
     payload: dict,
     num_results: int = Query(5, ge=1, le=20, description="Number of search results to use (1–20)"),
     language: str = Query("en", description="Search language code")
 ):
-    """Unified chat endpoint: does search + summary + chat reply in one response."""
-    user_message = payload.get("message", "").strip()
-    if not user_message:
-        raise HTTPException(status_code=400, detail="Empty message")
+    """Unified chat endpoint: remembers last 10 messages for smoother conversation."""
+    messages = payload.get("messages", [])
+    if not messages or not any(m.get("role") == "user" and m.get("content", "").strip() for m in messages):
+        raise HTTPException(status_code=400, detail="Empty messages")
+
+    # Take the last 10 messages for context
+    last_messages = messages[-10:]
+    # Extract the latest user message for search
+    user_messages = [m for m in last_messages if m.get("role") == "user"]
+    if not user_messages:
+        raise HTTPException(status_code=400, detail="No user message found in last 10 messages")
+    latest_user_message = user_messages[-1]["content"].strip()
 
     # Step 1: Perform SearXNG search
-    params = {"q": user_message, "format": "json", "language": language}
+    params = {"q": latest_user_message, "format": "json", "language": language}
     try:
         resp = requests.get(SEARXNG_URL, params=params, timeout=10)
         resp.raise_for_status()
@@ -163,7 +203,7 @@ def chat_with_search_and_summary(
 
     if not search_data:
         return {
-            "query": user_message,
+            "query": latest_user_message,
             "results": [],
             "summary": "No search results found.",
             "reply": "I couldn't find any relevant search results."
@@ -192,21 +232,22 @@ def chat_with_search_and_summary(
             temperature=0.7
         )
         summary_text = summary_resp.choices[0].message.content.strip()
-    except Exception as e:
+    except Exception:
         summary_text = "Error generating summary."
 
-    # Step 5: Generate chat reply using search + summary context
-    chat_prompt = (
-        f"You are a helpful assistant. Use the following summarized and raw search results "
-        f"to answer the user's question.\n\nSummary:\n{summary_text}\n\n"
-        f"Search Results:\n{text_for_summary}\n\n"
-        f"User's question: {user_message}\n"
-        "Provide a clear, factual answer based on the above."
+    # Step 5: Generate chat reply using last 10 messages + search context
+    messages_for_ai = last_messages.copy()  # Keep last 10 messages
+    # Add search summary and results as system message for context
+    context_text = (
+        f"Search Summary:\n{summary_text}\n\n"
+        f"Search Results:\n{text_for_summary}"
     )
+    messages_for_ai.append({"role": "system", "content": f"Use the following context to answer the user:\n{context_text}"})
+
     try:
         chat_resp = client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": chat_prompt}],
+            messages=messages_for_ai,
             max_tokens=400,
             temperature=0.7
         )
@@ -226,7 +267,7 @@ def chat_with_search_and_summary(
     ]
 
     return {
-        "query": user_message,
+        "query": latest_user_message,
         "results": results_with_images,
         "summary": summary_text,
         "reply": reply_text
