@@ -49,3 +49,25 @@ A private, customizable, AI-enhanced search engine where users’ identities and
 
 ## Architecture Overview
 
+The system consists of four main components: **Frontend**, **Backend**, **Search Engine**, and **AI Service**.
+
+### Frontend (React App)
+- Users enter search queries or chat messages in the web interface.
+- Sends requests to the backend for search or chat operations.
+
+### Backend (FastAPI)
+- Receives search and chat requests from the frontend.
+- Strips identifying headers to preserve privacy.
+- Routes all search queries to SearXNG via Tor, ensuring user IPs are hidden.
+- Sends search results to OpenAI API to generate summaries and chatbot responses.
+
+### Search Engine (SearXNG + Tor)
+- SearXNG aggregates results from multiple search engines.
+- All outgoing queries are routed through Tor for anonymity.
+- Returns raw search results to the backend.
+
+### AI Service (OpenAI GPT-3.5-Turbo)
+- Generates concise summaries of search results.
+- Provides chatbot responses based only on SearXNG results and recent conversation history (last 10 messages).
+
+
